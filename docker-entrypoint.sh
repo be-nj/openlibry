@@ -30,15 +30,15 @@ if [ ! -f "$DB_PATH" ]; then
 
   if has_migrations; then
     echo "Migrations detected. Running: prisma migrate deploy"
-    npx prisma migrate deploy
+    prisma migrate deploy
   else
     echo "No migrations found. Running: prisma db push"
-    npx prisma db push
+    prisma db push
   fi
 else
   if has_migrations; then
     echo "Database exists. Applying pending migrations..."
-    npx prisma migrate deploy
+    prisma migrate deploy
   else
     echo "Database exists, no migrations. Skipping schema sync."
   fi

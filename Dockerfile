@@ -3,32 +3,34 @@ FROM node:22-alpine AS base
 RUN apk add --no-cache libc6-compat openssl
 WORKDIR /app
 
-# ---- Dependencies (cacheable, prod only) ----
-FROM base AS deps
-COPY package.json ./
-COPY package-lock.json ./
-RUN npm install -g npm@11.6.4
-RUN echo "=== BUILDING WITH UPDATED DOCKERFILE ===" && npm --version
-RUN echo "=== FILES COPIED ===" && ls -la
-# Avoid dev deps here so Cypress doesn't run in this layer
-RUN npm install --ignore-scripts
-
 # ---- Builder (needs dev deps, but skip Cypress binary) ----
 FROM base AS builder
 
 ENV CYPRESS_INSTALL_BINARY=0
 ENV DATABASE_URL="file:./dummy.db"
-COPY package.json ./
-COPY package-lock.json ./
-RUN npm install -g npm@11.6.4
-RUN echo "=== BUILDING WITH UPDATED DOCKERFILE ===" && npm --version
-RUN echo "=== FILES COPIED ===" && ls -la
-RUN npm install 
+COPY package.json package-lock.json ./
+# npm ci installs exactly what package-lock.json pins and fails if the lockfile
+# and package.json ever drift apart, instead of silently re-resolving them.
+RUN npm ci
 COPY . .
 # Generate Prisma Client at build time
 RUN npx prisma generate
 ENV NEXT_TELEMETRY_DISABLED=1
 RUN npm run build
+
+# ---- Prisma CLI (isolated) ----
+# docker-entrypoint.sh needs the Prisma CLI to run migrations at container start,
+# but nothing else from the build tree. Installing it on its own keeps the build
+# toolchain (typescript, eslint, cypress, tailwind, next) out of the final image.
+# The version is read from package.json so it stays in lockstep with @prisma/client.
+FROM base AS prisma-cli
+WORKDIR /cli
+COPY package.json ./app-package.json
+RUN PRISMA_VERSION="$(node -p "require('/cli/app-package.json').dependencies.prisma")" \
+    && rm app-package.json \
+    && npm init -y > /dev/null \
+    && npm install --no-audit --no-fund "prisma@${PRISMA_VERSION}" \
+    && npm cache clean --force
 
 # ---- Runner (slim) ----
 FROM base AS runner
@@ -39,7 +41,9 @@ ENV PORT=3000
 # Your DB is bind-mounted here from the host
 ENV DATABASE_URL="file:/app/database/dev.db"
 
-# Copy runtime artifacts (Next.js standalone output recommended)
+# Copy runtime artifacts. The Next.js standalone output already ships the traced
+# runtime dependencies (@prisma/client, the generated client, better-sqlite3,
+# sharp), so the build stage's node_modules is deliberately not copied.
 COPY --from=builder /app/.next/standalone ./
 COPY --from=builder /app/.next/static ./.next/static
 COPY --from=builder /app/public ./public
@@ -52,18 +56,18 @@ COPY --from=builder /app/prisma.config.mjs ./
 # (existing files are never overwritten, so school customisations survive).
 COPY --from=builder /app/database/custom/labels /app/defaults/labels
 
+# The isolated Prisma CLI goes to /node_modules, one level above the app. Node
+# resolves prisma.config.mjs's imports (prisma/config, dotenv/config) from there,
+# while /app/node_modules keeps serving the application's own runtime deps.
+COPY --from=prisma-cli /cli/node_modules /node_modules
+ENV PATH="/node_modules/.bin:${PATH}"
+
 # Ensure DB directory exists and fix perms
 RUN mkdir -p /app/database && chown -R node:node /app
 
 # Add entrypoint that runs Prisma schema sync on first run / on pending migrations
 COPY docker-entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh
-
-# Make Prisma CLI available at runtime via node_modules from builder (lightweight)
-# We copy only what's needed for npx to find prisma: package.json, lockfile and node_modules/prisma*
-# If your devDeps are heavy, you can replace this with: RUN npm i -g prisma@6.13.0
-COPY --from=builder /app/package*.json ./
-COPY --from=builder /app/node_modules ./node_modules
 
 USER node
 EXPOSE 3000
